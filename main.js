@@ -1064,7 +1064,7 @@ class GranolaSyncPlugin extends obsidian.Plugin {
 	 * @returns {Object|null} The panel content or null if not found
 	 */
 	extractPanelContent(doc, panelType) {
-		// First check the panels array if available
+		// First check the panels array if available (legacy ProseMirror format)
 		if (doc.panels && Array.isArray(doc.panels)) {
 			for (const panel of doc.panels) {
 				if (panel.type === panelType && panel.content && panel.content.type === 'doc') {
@@ -1075,16 +1075,119 @@ class GranolaSyncPlugin extends obsidian.Plugin {
 
 		// Fallback: check last_viewed_panel for enhanced notes
 		if (panelType === 'enhanced_notes' && doc.last_viewed_panel &&
-			doc.last_viewed_panel.content && doc.last_viewed_panel.content.type === 'doc') {
-			return doc.last_viewed_panel.content;
+			doc.last_viewed_panel.content) {
+			// New API format: content is an HTML string
+			if (typeof doc.last_viewed_panel.content === 'string') {
+				return { __html: doc.last_viewed_panel.content };
+			}
+			// Legacy format: ProseMirror doc object
+			if (doc.last_viewed_panel.content.type === 'doc') {
+				return doc.last_viewed_panel.content;
+			}
 		}
 
 		// Fallback: for my_notes, check doc.content directly (user's own notes)
-		if (panelType === 'my_notes' && doc.content && doc.content.type === 'doc') {
-			return doc.content;
+		if (panelType === 'my_notes' && doc.content) {
+			if (typeof doc.content === 'string') {
+				return { __html: doc.content };
+			}
+			if (doc.content.type === 'doc') {
+				return doc.content;
+			}
 		}
 
 		return null;
+	}
+
+	/**
+	 * Converts HTML string to Markdown.
+	 * Handles the new Granola API format where panel content is HTML.
+	 */
+	convertHtmlToMarkdown(html) {
+		if (!html || typeof html !== 'string') return '';
+
+		let md = html;
+
+		// Convert headings
+		md = md.replace(/<h([1-6])[^>]*>(.*?)<\/h[1-6]>/gi, (_, level, content) => {
+			return '#'.repeat(parseInt(level)) + ' ' + content.trim() + '\n\n';
+		});
+
+		// Convert list items with nested lists - process from inside out
+		// First, handle nested <ul> inside <li> by preserving structure
+		// We'll process this iteratively to handle arbitrary nesting
+
+		// Convert <br> tags
+		md = md.replace(/<br\s*\/?>/gi, '\n');
+
+		// Convert bold
+		md = md.replace(/<(strong|b)>(.*?)<\/(strong|b)>/gi, '**$2**');
+
+		// Convert italic
+		md = md.replace(/<(em|i)>(.*?)<\/(em|i)>/gi, '*$2*');
+
+		// Convert links
+		md = md.replace(/<a[^>]+href="([^"]*)"[^>]*>(.*?)<\/a>/gi, '[$2]($1)');
+
+		// Convert code
+		md = md.replace(/<code>(.*?)<\/code>/gi, '`$1`');
+
+		// Convert paragraphs
+		md = md.replace(/<p[^>]*>(.*?)<\/p>/gi, '$1\n\n');
+
+		// Process nested lists by converting to markdown with indentation
+		const processLists = (text) => {
+			// Track nesting depth
+			let result = '';
+			let depth = -1;
+			const lines = [];
+
+			// Simple state machine parser for nested lists
+			const tokens = text.split(/(<\/?(?:ul|ol|li)[^>]*>)/gi).filter(t => t);
+
+			for (const token of tokens) {
+				const lower = token.toLowerCase().trim();
+				if (lower === '<ul>' || lower === '<ol>') {
+					depth++;
+				} else if (lower === '</ul>' || lower === '</ol>') {
+					depth--;
+				} else if (lower === '<li>') {
+					// Next text content will be a list item
+				} else if (lower === '</li>') {
+					// End of list item
+				} else if (depth >= 0) {
+					const content = token.replace(/<[^>]*>/g, '').trim();
+					if (content) {
+						lines.push('  '.repeat(depth) + '- ' + content);
+					}
+				} else {
+					lines.push(token);
+				}
+			}
+
+			return lines.join('\n');
+		};
+
+		// Check if there are lists to process
+		if (md.includes('<ul>') || md.includes('<ol>') || md.includes('<UL>') || md.includes('<OL>')) {
+			md = processLists(md);
+		}
+
+		// Clean up any remaining HTML tags
+		md = md.replace(/<[^>]*>/g, '');
+
+		// Decode HTML entities
+		md = md.replace(/&amp;/g, '&');
+		md = md.replace(/&lt;/g, '<');
+		md = md.replace(/&gt;/g, '>');
+		md = md.replace(/&quot;/g, '"');
+		md = md.replace(/&#39;/g, "'");
+		md = md.replace(/&nbsp;/g, ' ');
+
+		// Clean up excessive newlines
+		md = md.replace(/\n{3,}/g, '\n\n');
+
+		return md.trim();
 	}
 
 	/**
@@ -1104,7 +1207,10 @@ class GranolaSyncPlugin extends obsidian.Plugin {
 		// Extract My Notes content
 		const myNotesContent = this.extractPanelContent(doc, 'my_notes');
 		if (myNotesContent && this.settings.includeMyNotes) {
-			const myNotesMarkdown = this.convertProseMirrorToMarkdown(myNotesContent);
+			// Handle both HTML (new API) and ProseMirror (legacy) formats
+			const myNotesMarkdown = myNotesContent.__html
+				? this.convertHtmlToMarkdown(myNotesContent.__html)
+				: this.convertProseMirrorToMarkdown(myNotesContent);
 			if (myNotesMarkdown && myNotesMarkdown.trim()) {
 				sections.push('\n## My Notes\n\n' + myNotesMarkdown.trim());
 			}
@@ -1113,7 +1219,10 @@ class GranolaSyncPlugin extends obsidian.Plugin {
 		// Extract Enhanced Notes content
 		const enhancedNotesContent = this.extractPanelContent(doc, 'enhanced_notes');
 		if (enhancedNotesContent && this.settings.includeEnhancedNotes) {
-			const enhancedNotesMarkdown = this.convertProseMirrorToMarkdown(enhancedNotesContent);
+			// Handle both HTML (new API) and ProseMirror (legacy) formats
+			const enhancedNotesMarkdown = enhancedNotesContent.__html
+				? this.convertHtmlToMarkdown(enhancedNotesContent.__html)
+				: this.convertProseMirrorToMarkdown(enhancedNotesContent);
 			if (enhancedNotesMarkdown && enhancedNotesMarkdown.trim()) {
 				// If we have My Notes, add Enhanced Notes as a separate section
 				if (myNotesContent && this.settings.includeMyNotes) {
